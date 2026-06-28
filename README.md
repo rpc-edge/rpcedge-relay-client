@@ -17,8 +17,9 @@ Public Rust client and shared protocol types:
 
 - `rpcedge-relay-protocol`: public method, route, route-set, HTTP envelope, and
   QUIC frame types.
-- `rpcedge-relay-client`: async HTTP client for the route-aware
-  `POST /v1/submit` endpoint.
+- `rpcedge-relay-client`: async HTTP client for route-aware
+  `POST /v1/submit`, compatibility JSON-RPC `POST /v1/sendTransaction`, raw
+  HTTP `POST /v1/transactions`, and the current QUIC canary transaction path.
 
 Public launch scope is single-transaction submission:
 
@@ -70,6 +71,10 @@ fall back to server defaults.
 
 - HTTP JSON envelope: `POST /v1/submit`
 - Raw HTTP compatibility: `POST /v1/transactions`
-- QUIC framed v1 with ALPN `rpcedge-submit-v1` is planned.
+- JSON-RPC HTTP compatibility: `POST /v1/sendTransaction`
+- QUIC canary: persistent QUIC connection with one bidirectional stream per
+  transaction. The current live gateway protocol is
+  `api-key: <key>\n<raw_tx>`. QUIC framed v1 with ALPN `rpcedge-submit-v1` is
+  still the target protocol, but not the live gateway wire format yet.
 
 See the Polaris architecture docs for the rollout plan.
