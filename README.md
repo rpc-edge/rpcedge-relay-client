@@ -19,7 +19,8 @@ Public Rust client and shared protocol types:
   QUIC frame types.
 - `rpcedge-relay-client`: async HTTP client for route-aware
   `POST /v1/submit`, compatibility JSON-RPC `POST /v1/sendTransaction`, raw
-  HTTP `POST /v1/transactions`, and the current QUIC canary transaction path.
+  HTTP `POST /v1/transactions`, and route-aware QUIC single-transaction
+  submission.
 
 Public launch scope is single-transaction submission:
 
@@ -72,9 +73,34 @@ fall back to server defaults.
 - HTTP JSON envelope: `POST /v1/submit`
 - Raw HTTP compatibility: `POST /v1/transactions`
 - JSON-RPC HTTP compatibility: `POST /v1/sendTransaction`
-- QUIC canary: persistent QUIC connection with one bidirectional stream per
-  transaction. The current live gateway protocol is
-  `api-key: <key>\n<raw_tx>`. QUIC framed v1 with ALPN `rpcedge-submit-v1` is
-  still the target protocol, but not the live gateway wire format yet.
+- QUIC: persistent QUIC connection with one bidirectional stream per
+  transaction. The stream begins with `api-key: <key>\n`, followed by the
+  framed `QuicSubmitHeader` plus raw transaction payload. The header carries
+  `request_id` and `route_set`, so QUIC route selection is now equivalent to
+  HTTP `/v1/submit`. The server keeps the legacy
+  `api-key: <key>\n<raw_tx>` fallback for old clients, but legacy raw QUIC
+  always uses server defaults.
+
+Route-aware QUIC example:
+
+```rust
+use rpcedge_relay_client::{QuicRelayClient, RelayClientConfig};
+use rpcedge_relay_protocol::{RelayRoute, RouteSet};
+
+# async fn example(raw_tx: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+let client = QuicRelayClient::connect(RelayClientConfig::new(
+    "https://relay.rpcedge.com:4433",
+    "00000000-0000-4000-8000-000000000000",
+))
+.await?;
+
+let response = client
+    .send_transaction_raw_bytes_with_route_set(raw_tx, RouteSet::only([RelayRoute::TpuQuic]))
+    .await?;
+
+println!("accepted={} signature={}", response.accepted, response.signature);
+# Ok(())
+# }
+```
 
 See the Polaris architecture docs for the rollout plan.
