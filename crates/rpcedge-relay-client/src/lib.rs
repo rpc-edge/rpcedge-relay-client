@@ -1,7 +1,7 @@
 use quinn::{ClientConfig, Endpoint};
 pub use rpcedge_relay_protocol::{
-    decode_transaction_base64, RelayMethod, RelayRoute, RouteSet, RouteSetMode, SubmitRequest,
-    TransactionEncoding, VERSION,
+    decode_transaction_base64, encode_quic_frame, QuicPayloadKind, QuicSubmitHeader, RelayMethod,
+    RelayRoute, RouteSet, RouteSetMode, SubmitRequest, TransactionEncoding, VERSION,
 };
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -295,13 +295,37 @@ impl QuicRelayClient {
         &self,
         transaction: impl AsRef<[u8]>,
     ) -> Result<SubmitResponse, RelayClientError> {
+        self.send_transaction_raw_bytes_with_route_set(transaction, RouteSet::server_default())
+            .await
+    }
+
+    pub async fn send_transaction_raw_bytes_with_route_set(
+        &self,
+        transaction: impl AsRef<[u8]>,
+        route_set: RouteSet,
+    ) -> Result<SubmitResponse, RelayClientError> {
+        self.send_transaction_raw_bytes_with_request_id(transaction, route_set, None)
+            .await
+    }
+
+    pub async fn send_transaction_raw_bytes_with_request_id(
+        &self,
+        transaction: impl AsRef<[u8]>,
+        route_set: RouteSet,
+        request_id: Option<String>,
+    ) -> Result<SubmitResponse, RelayClientError> {
         let (mut send, mut recv) =
             tokio::time::timeout(self.config.timeout, self.connection.open_bi())
                 .await
                 .map_err(|_| RelayClientError::Timeout("QUIC open stream"))?
                 .map_err(RelayClientError::QuicOpenStream)?;
-        let frame =
-            encode_current_quic_canary_frame(self.config.api_key.trim(), transaction.as_ref());
+        let frame = encode_routed_quic_frame(
+            self.config.api_key.trim(),
+            transaction.as_ref(),
+            route_set,
+            request_id,
+        )
+        .map_err(RelayClientError::Protocol)?;
         tokio::time::timeout(self.config.timeout, send.write_all(&frame))
             .await
             .map_err(|_| RelayClientError::Timeout("QUIC write"))?
@@ -322,9 +346,22 @@ impl QuicRelayClient {
         &self,
         transaction_base64: &str,
     ) -> Result<SubmitResponse, RelayClientError> {
+        self.send_transaction_raw_base64_with_route_set(
+            transaction_base64,
+            RouteSet::server_default(),
+        )
+        .await
+    }
+
+    pub async fn send_transaction_raw_base64_with_route_set(
+        &self,
+        transaction_base64: &str,
+        route_set: RouteSet,
+    ) -> Result<SubmitResponse, RelayClientError> {
         let transaction =
             decode_transaction_base64(transaction_base64).map_err(RelayClientError::Protocol)?;
-        self.send_transaction_raw_bytes(transaction).await
+        self.send_transaction_raw_bytes_with_route_set(transaction, route_set)
+            .await
     }
 }
 
@@ -348,13 +385,27 @@ fn build_quic_client_config(
     )))
 }
 
-fn encode_current_quic_canary_frame(api_key: &str, transaction: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity("api-key: \n".len() + api_key.len() + transaction.len());
+fn encode_routed_quic_frame(
+    api_key: &str,
+    transaction: &[u8],
+    route_set: RouteSet,
+    request_id: Option<String>,
+) -> Result<Vec<u8>, rpcedge_relay_protocol::ProtocolError> {
+    let header = QuicSubmitHeader {
+        version: VERSION,
+        method: RelayMethod::SendTransaction,
+        payload_kind: QuicPayloadKind::SingleRawTransaction,
+        request_id,
+        route_set,
+        signature: None,
+    };
+    let payload = encode_quic_frame(&header, transaction)?;
+    let mut frame = Vec::with_capacity("api-key: \n".len() + api_key.len() + payload.len());
     frame.extend_from_slice(b"api-key: ");
     frame.extend_from_slice(api_key.as_bytes());
     frame.push(b'\n');
-    frame.extend_from_slice(transaction);
-    frame
+    frame.extend_from_slice(&payload);
+    Ok(frame)
 }
 
 fn parse_quic_response(response: &[u8]) -> Result<SubmitResponse, RelayClientError> {
@@ -549,5 +600,27 @@ mod tests {
             error,
             RelayClientError::Status { status: 403, .. }
         ));
+    }
+
+    #[test]
+    fn quic_frame_encoder_carries_route_set_after_api_key_prelude() {
+        let frame = encode_routed_quic_frame(
+            "plab_test_key",
+            b"tx-bytes",
+            RouteSet::only([RelayRoute::TpuQuic]),
+            Some("req-1".to_string()),
+        )
+        .unwrap();
+        let newline = frame
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .expect("api key prelude");
+
+        assert_eq!(&frame[..newline], b"api-key: plab_test_key");
+        let (header, payload) =
+            rpcedge_relay_protocol::decode_quic_frame(&frame[newline + 1..]).unwrap();
+        assert_eq!(header.route_set, RouteSet::only([RelayRoute::TpuQuic]));
+        assert_eq!(header.request_id.as_deref(), Some("req-1"));
+        assert_eq!(payload, b"tx-bytes");
     }
 }

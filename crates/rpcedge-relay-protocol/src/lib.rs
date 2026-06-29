@@ -389,4 +389,26 @@ mod tests {
         assert_eq!(decoded_header, header);
         assert_eq!(decoded_payload, b"tx");
     }
+
+    #[test]
+    fn quic_frame_preserves_route_set_and_request_id() {
+        let header = QuicSubmitHeader {
+            version: VERSION,
+            method: RelayMethod::SendTransaction,
+            payload_kind: QuicPayloadKind::SingleRawTransaction,
+            request_id: Some("bench-req-1".to_string()),
+            route_set: RouteSet::only([RelayRoute::TpuQuic]),
+            signature: None,
+        };
+        let payload = b"unique-transaction-bytes";
+        let encoded = encode_quic_frame(&header, payload).unwrap();
+        let (decoded_header, decoded_payload) = decode_quic_frame(&encoded).unwrap();
+
+        assert_eq!(
+            decoded_header.route_set,
+            RouteSet::only([RelayRoute::TpuQuic])
+        );
+        assert_eq!(decoded_header.request_id.as_deref(), Some("bench-req-1"));
+        assert_eq!(decoded_payload, payload);
+    }
 }
