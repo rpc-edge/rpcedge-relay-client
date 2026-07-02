@@ -44,6 +44,13 @@ pub enum RouteSetMode {
     DefaultMinus,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseMode {
+    Fast,
+    RouteResults,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteSet {
     pub mode: RouteSetMode,
@@ -134,6 +141,13 @@ pub struct SubmitRequest {
     pub request_id: Option<String>,
     #[serde(default)]
     pub route_set: RouteSet,
+    #[serde(
+        default,
+        rename = "responseMode",
+        alias = "response_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_mode: Option<ResponseMode>,
     #[serde(default)]
     pub transaction_encoding: Option<TransactionEncoding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,6 +163,7 @@ impl SubmitRequest {
             method: RelayMethod::SendTransaction,
             request_id: None,
             route_set,
+            response_mode: None,
             transaction_encoding: Some(TransactionEncoding::Base64),
             transaction: Some(transaction.into()),
             transactions: None,
@@ -161,6 +176,7 @@ impl SubmitRequest {
             method: RelayMethod::SendBundle,
             request_id: None,
             route_set,
+            response_mode: None,
             transaction_encoding: Some(TransactionEncoding::Base64),
             transaction: None,
             transactions: Some(transactions),
@@ -202,6 +218,13 @@ pub struct QuicSubmitHeader {
     pub request_id: Option<String>,
     #[serde(default)]
     pub route_set: RouteSet,
+    #[serde(
+        default,
+        rename = "responseMode",
+        alias = "response_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_mode: Option<ResponseMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }
@@ -381,6 +404,7 @@ mod tests {
             payload_kind: QuicPayloadKind::SingleRawTransaction,
             request_id: Some("req-1".to_string()),
             route_set: RouteSet::server_default(),
+            response_mode: None,
             signature: Some("sig".to_string()),
         };
         let encoded = encode_quic_frame(&header, b"tx").unwrap();
@@ -398,6 +422,7 @@ mod tests {
             payload_kind: QuicPayloadKind::SingleRawTransaction,
             request_id: Some("bench-req-1".to_string()),
             route_set: RouteSet::only([RelayRoute::TpuQuic]),
+            response_mode: Some(ResponseMode::RouteResults),
             signature: None,
         };
         let payload = b"unique-transaction-bytes";
@@ -409,6 +434,7 @@ mod tests {
             RouteSet::only([RelayRoute::TpuQuic])
         );
         assert_eq!(decoded_header.request_id.as_deref(), Some("bench-req-1"));
+        assert_eq!(decoded_header.response_mode, Some(ResponseMode::RouteResults));
         assert_eq!(decoded_payload, payload);
     }
 }

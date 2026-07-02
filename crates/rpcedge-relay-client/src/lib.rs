@@ -1,7 +1,7 @@
 use quinn::{ClientConfig, Endpoint};
 pub use rpcedge_relay_protocol::{
     decode_transaction_base64, encode_quic_frame, QuicPayloadKind, QuicSubmitHeader, RelayMethod,
-    RelayRoute, RouteSet, RouteSetMode, SubmitRequest, TransactionEncoding, VERSION,
+    RelayRoute, ResponseMode, RouteSet, RouteSetMode, SubmitRequest, TransactionEncoding, VERSION,
 };
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -146,6 +146,8 @@ impl RelayClient {
             accepted: true,
             request_id: response.request_id,
             signature: response.result,
+            route_results: Vec::new(),
+            route_results_complete: None,
         })
     }
 
@@ -314,6 +316,22 @@ impl QuicRelayClient {
         route_set: RouteSet,
         request_id: Option<String>,
     ) -> Result<SubmitResponse, RelayClientError> {
+        self.send_transaction_raw_bytes_with_request_id_and_response_mode(
+            transaction,
+            route_set,
+            request_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn send_transaction_raw_bytes_with_request_id_and_response_mode(
+        &self,
+        transaction: impl AsRef<[u8]>,
+        route_set: RouteSet,
+        request_id: Option<String>,
+        response_mode: Option<ResponseMode>,
+    ) -> Result<SubmitResponse, RelayClientError> {
         let (mut send, mut recv) =
             tokio::time::timeout(self.config.timeout, self.connection.open_bi())
                 .await
@@ -324,6 +342,7 @@ impl QuicRelayClient {
             transaction.as_ref(),
             route_set,
             request_id,
+            response_mode,
         )
         .map_err(RelayClientError::Protocol)?;
         tokio::time::timeout(self.config.timeout, send.write_all(&frame))
@@ -390,6 +409,7 @@ fn encode_routed_quic_frame(
     transaction: &[u8],
     route_set: RouteSet,
     request_id: Option<String>,
+    response_mode: Option<ResponseMode>,
 ) -> Result<Vec<u8>, rpcedge_relay_protocol::ProtocolError> {
     let header = QuicSubmitHeader {
         version: VERSION,
@@ -397,6 +417,7 @@ fn encode_routed_quic_frame(
         payload_kind: QuicPayloadKind::SingleRawTransaction,
         request_id,
         route_set,
+        response_mode,
         signature: None,
     };
     let payload = encode_quic_frame(&header, transaction)?;
@@ -461,6 +482,35 @@ pub struct SubmitResponse {
     pub accepted: bool,
     pub request_id: String,
     pub signature: String,
+    #[serde(default)]
+    pub route_results: Vec<RouteResultResponse>,
+    #[serde(default)]
+    pub route_results_complete: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct RouteResultResponse {
+    pub route: String,
+    pub route_name: String,
+    pub provider: String,
+    pub accepted: bool,
+    pub latency_us: u64,
+    #[serde(default)]
+    pub error_class: Option<String>,
+    #[serde(default)]
+    pub provider_status_code: Option<u16>,
+    #[serde(default)]
+    pub provider_error_code: Option<String>,
+    #[serde(default)]
+    pub bundle_id: Option<String>,
+    #[serde(default)]
+    pub route_tip_signature: Option<String>,
+    #[serde(default)]
+    pub route_tip_lamports: Option<u64>,
+    #[serde(default)]
+    pub route_tip_account: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -570,6 +620,8 @@ mod tests {
                 accepted: true,
                 request_id: "relay-req-1".to_string(),
                 signature: "sig-1".to_string(),
+                route_results: Vec::new(),
+                route_results_complete: None,
             }
         );
     }
@@ -609,6 +661,7 @@ mod tests {
             b"tx-bytes",
             RouteSet::only([RelayRoute::TpuQuic]),
             Some("req-1".to_string()),
+            Some(ResponseMode::RouteResults),
         )
         .unwrap();
         let newline = frame
@@ -621,6 +674,7 @@ mod tests {
             rpcedge_relay_protocol::decode_quic_frame(&frame[newline + 1..]).unwrap();
         assert_eq!(header.route_set, RouteSet::only([RelayRoute::TpuQuic]));
         assert_eq!(header.request_id.as_deref(), Some("req-1"));
+        assert_eq!(header.response_mode, Some(ResponseMode::RouteResults));
         assert_eq!(payload, b"tx-bytes");
     }
 }
