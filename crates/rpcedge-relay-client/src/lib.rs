@@ -498,10 +498,6 @@ pub struct RouteResultResponse {
     #[serde(default)]
     pub error_class: Option<String>,
     #[serde(default)]
-    pub provider_status_code: Option<u16>,
-    #[serde(default)]
-    pub provider_error_code: Option<String>,
-    #[serde(default)]
     pub bundle_id: Option<String>,
     #[serde(default)]
     pub route_tip_signature: Option<String>,
@@ -509,8 +505,6 @@ pub struct RouteResultResponse {
     pub route_tip_lamports: Option<u64>,
     #[serde(default)]
     pub route_tip_account: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
