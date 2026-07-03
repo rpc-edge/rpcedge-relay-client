@@ -17,7 +17,7 @@ const JSON_RPC_PATH: &str = "/v1/sendTransaction";
 const RAW_TRANSACTION_PATH: &str = "/v1/transactions";
 const DEFAULT_QUIC_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_QUIC_SERVER_NAME: &str = "relay.rpcedge.com";
-const DEFAULT_QUIC_MAX_RESPONSE_BYTES: usize = 4096;
+const DEFAULT_QUIC_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayClientConfig {
@@ -39,6 +39,7 @@ impl RelayClientConfig {
         self.timeout = timeout;
         self
     }
+
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +257,11 @@ impl QuicRelayClientConfig {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
+        self.max_response_bytes = max_response_bytes;
         self
     }
 }
@@ -670,5 +676,17 @@ mod tests {
         assert_eq!(header.request_id.as_deref(), Some("req-1"));
         assert_eq!(header.response_mode, Some(ResponseMode::RouteResults));
         assert_eq!(payload, b"tx-bytes");
+    }
+
+    #[test]
+    fn quic_config_allows_large_route_result_responses() {
+        let config = QuicRelayClientConfig::new(
+            "127.0.0.1:4433".parse().unwrap(),
+            "00000000-0000-4000-8000-000000000000",
+        );
+        assert_eq!(config.max_response_bytes, 64 * 1024);
+
+        let config = config.with_max_response_bytes(128 * 1024);
+        assert_eq!(config.max_response_bytes, 128 * 1024);
     }
 }
