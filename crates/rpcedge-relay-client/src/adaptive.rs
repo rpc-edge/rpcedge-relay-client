@@ -370,15 +370,59 @@ async fn run_quic_supervisor(
     published: Arc<ArcSwapOption<QuicRelayClient>>,
     generation: Arc<AtomicU64>,
 ) {
+    run_quic_supervisor_with(
+        RealQuicConnector { quic_config },
+        supervisor_config,
+        published,
+        generation,
+    )
+    .await;
+}
+
+#[async_trait]
+trait SupervisedQuicConnector: Send + Sync + 'static {
+    type Client: Send + Sync + 'static;
+
+    async fn connect(&self) -> Result<Self::Client, ()>;
+    async fn wait_closed(&self, client: &Self::Client);
+}
+
+struct RealQuicConnector {
+    quic_config: QuicRelayClientConfig,
+}
+
+#[async_trait]
+impl SupervisedQuicConnector for RealQuicConnector {
+    type Client = QuicRelayClient;
+
+    async fn connect(&self) -> Result<Self::Client, ()> {
+        QuicRelayClient::connect(self.quic_config.clone())
+            .await
+            .map_err(|_| ())
+    }
+
+    async fn wait_closed(&self, client: &Self::Client) {
+        let _ = client.connection.closed().await;
+    }
+}
+
+async fn run_quic_supervisor_with<C: SupervisedQuicConnector>(
+    connector: C,
+    supervisor_config: QuicSupervisorConfig,
+    published: Arc<ArcSwapOption<C::Client>>,
+    generation: Arc<AtomicU64>,
+) {
     let mut failures = 0_u32;
     loop {
-        match QuicRelayClient::connect(quic_config.clone()).await {
+        match connector.connect().await {
             Ok(client) => {
                 failures = 0;
-                let connection = client.connection.clone();
                 published.store(Some(Arc::new(client)));
                 generation.fetch_add(1, Ordering::Release);
-                let _ = connection.closed().await;
+                let connected = published
+                    .load_full()
+                    .expect("client was published immediately above");
+                connector.wait_closed(connected.as_ref()).await;
                 published.store(None);
                 tokio::time::sleep(reconnect_backoff(supervisor_config, 0)).await;
             }
@@ -472,8 +516,12 @@ mod tests {
     use async_trait::async_trait;
     use std::{
         collections::VecDeque,
-        sync::{Arc, Mutex},
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            Arc, Mutex,
+        },
     };
+    use tokio::sync::watch;
 
     #[derive(Debug)]
     struct FakeTransport {
@@ -493,6 +541,44 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct FakeSupervisedClient {
+        id: u64,
+        closed: watch::Receiver<bool>,
+    }
+
+    struct FakeConnector {
+        attempts: Arc<AtomicUsize>,
+        results: Mutex<VecDeque<Result<FakeSupervisedClient, ()>>>,
+    }
+
+    #[async_trait]
+    impl SupervisedQuicConnector for FakeConnector {
+        type Client = FakeSupervisedClient;
+
+        async fn connect(&self) -> Result<Self::Client, ()> {
+            self.attempts.fetch_add(1, AtomicOrdering::Relaxed);
+            self.results.lock().unwrap().pop_front().unwrap_or(Err(()))
+        }
+
+        async fn wait_closed(&self, client: &Self::Client) {
+            let mut closed = client.closed.clone();
+            if !*closed.borrow() {
+                let _ = closed.changed().await;
+            }
+        }
+    }
+
+    async fn wait_for_generation(generation: &AtomicU64, expected: u64) {
+        tokio::time::timeout(Duration::from_millis(250), async {
+            while generation.load(Ordering::Acquire) < expected {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("supervisor generation did not advance");
     }
 
     #[async_trait]
@@ -552,6 +638,48 @@ mod tests {
         };
         assert!(reconnect_backoff(config, 0) >= Duration::from_millis(7));
         assert!(reconnect_backoff(config, 16) <= config.max_backoff);
+    }
+
+    #[tokio::test]
+    async fn supervisor_recovers_after_connect_failure_and_closed_generation() {
+        let (close_first, first_closed) = watch::channel(false);
+        let (_close_second, second_closed) = watch::channel(false);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let connector = FakeConnector {
+            attempts: attempts.clone(),
+            results: Mutex::new(VecDeque::from([
+                Err(()),
+                Ok(FakeSupervisedClient {
+                    id: 1,
+                    closed: first_closed,
+                }),
+                Ok(FakeSupervisedClient {
+                    id: 2,
+                    closed: second_closed,
+                }),
+            ])),
+        };
+        let published = Arc::new(ArcSwapOption::empty());
+        let generation = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(run_quic_supervisor_with(
+            connector,
+            QuicSupervisorConfig {
+                initial_backoff: Duration::from_millis(1),
+                max_backoff: Duration::from_millis(2),
+            },
+            published.clone(),
+            generation.clone(),
+        ));
+
+        wait_for_generation(&generation, 1).await;
+        assert_eq!(published.load_full().unwrap().id, 1);
+        close_first.send(true).unwrap();
+        wait_for_generation(&generation, 2).await;
+        assert_eq!(published.load_full().unwrap().id, 2);
+        assert_eq!(attempts.load(AtomicOrdering::Relaxed), 3);
+
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
