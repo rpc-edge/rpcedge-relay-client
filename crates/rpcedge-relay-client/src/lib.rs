@@ -1,7 +1,15 @@
+mod adaptive;
+
+pub use adaptive::{
+    AdaptiveRelayClient, AdaptiveRelayClientConfig, AdaptiveRelaySupervisor, QuicReadiness,
+    QuicSupervisorConfig, RelayAttemptError, RelayFallbackReason, RelaySubmitReceipt,
+    RelayTransport,
+};
 use quinn::{ClientConfig, Endpoint};
 pub use rpcedge_relay_protocol::{
-    decode_transaction_base64, encode_quic_frame, QuicPayloadKind, QuicSubmitHeader, RelayMethod,
-    RelayRoute, ResponseMode, RouteSet, RouteSetMode, SubmitRequest, TransactionEncoding, VERSION,
+    decode_transaction_base64, encode_quic_frame, encode_transaction_base64, QuicPayloadKind,
+    QuicSubmitHeader, RelayMethod, RelayRoute, ResponseMode, RouteSet, RouteSetMode, SubmitRequest,
+    TransactionEncoding, VERSION,
 };
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -39,7 +47,6 @@ impl RelayClientConfig {
         self.timeout = timeout;
         self
     }
-
 }
 
 #[derive(Debug, Clone)]

@@ -12,6 +12,7 @@ repository = "https://github.com/rpc-edge/rpcedge-relay-client"
 rust-version = "1.86"
 
 [workspace.dependencies]
+arc-swap = "1"
 base64 = "0.22"
 httpmock = "0.7"
 quinn = "0.11"

@@ -434,7 +434,10 @@ mod tests {
             RouteSet::only([RelayRoute::TpuQuic])
         );
         assert_eq!(decoded_header.request_id.as_deref(), Some("bench-req-1"));
-        assert_eq!(decoded_header.response_mode, Some(ResponseMode::RouteResults));
+        assert_eq!(
+            decoded_header.response_mode,
+            Some(ResponseMode::RouteResults)
+        );
         assert_eq!(decoded_payload, payload);
     }
 }
