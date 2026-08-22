@@ -279,6 +279,61 @@ impl TransactionVersion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TransactionWireError {
+    #[error("transaction wire is empty")]
+    Empty,
+    #[error("transaction signature count is invalid")]
+    InvalidSignatureCount,
+    #[error("transaction signature vector is truncated")]
+    TruncatedSignatures,
+    #[error("transaction message prefix is missing")]
+    MissingMessagePrefix,
+    #[error("transaction wire version {0} is unsupported")]
+    UnsupportedVersion(u8),
+}
+
+/// Classify exact transaction bytes without allocating or deserializing.
+pub fn classify_transaction_wire(
+    transaction: &[u8],
+) -> Result<TransactionVersion, TransactionWireError> {
+    const MESSAGE_VERSION_PREFIX: u8 = 0x80;
+    const V1_PREFIX: u8 = MESSAGE_VERSION_PREFIX | 1;
+    const SIGNATURE_BYTES: usize = 64;
+
+    let first = *transaction.first().ok_or(TransactionWireError::Empty)?;
+    if first == V1_PREFIX {
+        return Ok(TransactionVersion::V1);
+    }
+    if first & MESSAGE_VERSION_PREFIX != 0 {
+        return Err(TransactionWireError::UnsupportedVersion(
+            first & !MESSAGE_VERSION_PREFIX,
+        ));
+    }
+    if first == 0 {
+        return Err(TransactionWireError::InvalidSignatureCount);
+    }
+
+    let message_offset = 1usize
+        .checked_add(usize::from(first) * SIGNATURE_BYTES)
+        .ok_or(TransactionWireError::TruncatedSignatures)?;
+    if transaction.len() < message_offset {
+        return Err(TransactionWireError::TruncatedSignatures);
+    }
+    let message_prefix = *transaction
+        .get(message_offset)
+        .ok_or(TransactionWireError::MissingMessagePrefix)?;
+    if message_prefix & MESSAGE_VERSION_PREFIX == 0 {
+        Ok(TransactionVersion::Legacy)
+    } else if message_prefix == MESSAGE_VERSION_PREFIX {
+        Ok(TransactionVersion::V0)
+    } else {
+        Err(TransactionWireError::UnsupportedVersion(
+            message_prefix & !MESSAGE_VERSION_PREFIX,
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuicPayloadKind {
@@ -383,9 +438,9 @@ pub fn decode_quic_frame_v2(frame: &[u8]) -> Result<(QuicSubmitHeaderV2, Vec<u8>
     let header: QuicSubmitHeaderV2 =
         serde_json::from_slice(&frame[4..4 + header_len]).map_err(ProtocolError::Json)?;
     validate_version_v2(header.version)?;
-    let payload = frame[4 + header_len..].to_vec();
-    validate_v2_transaction(&header, &payload)?;
-    Ok((header, payload))
+    let payload = &frame[4 + header_len..];
+    validate_v2_transaction(&header, payload)?;
+    Ok((header, payload.to_vec()))
 }
 
 fn validate_v2_transaction(
@@ -464,6 +519,15 @@ pub enum ProtocolError {
         protocol_version: u8,
         transaction_version: TransactionVersion,
     },
+    #[error(
+        "declared transaction version {declared:?} does not match wire version {classified:?}"
+    )]
+    TransactionVersionMismatch {
+        declared: TransactionVersion,
+        classified: TransactionVersion,
+    },
+    #[error(transparent)]
+    TransactionWire(#[from] TransactionWireError),
     #[error("invalid json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid base64 transaction: {0}")]
@@ -481,6 +545,49 @@ mod tests {
         frame.extend_from_slice(&header);
         frame.extend_from_slice(payload);
         frame
+    }
+
+    fn legacy_wire(message_prefix: u8) -> Vec<u8> {
+        let mut wire = vec![0; 1 + 64 + 1];
+        wire[0] = 1;
+        wire[65] = message_prefix;
+        wire
+    }
+
+    #[test]
+    fn classifies_transaction_wire_versions_without_deserializing() {
+        assert_eq!(
+            classify_transaction_wire(&legacy_wire(0)),
+            Ok(TransactionVersion::Legacy)
+        );
+        assert_eq!(
+            classify_transaction_wire(&legacy_wire(0x80)),
+            Ok(TransactionVersion::V0)
+        );
+        assert_eq!(
+            classify_transaction_wire(&[0x81]),
+            Ok(TransactionVersion::V1)
+        );
+    }
+
+    #[test]
+    fn transaction_wire_classifier_rejects_malformed_and_future_versions() {
+        assert_eq!(
+            classify_transaction_wire(&[]),
+            Err(TransactionWireError::Empty)
+        );
+        assert_eq!(
+            classify_transaction_wire(&[1]),
+            Err(TransactionWireError::TruncatedSignatures)
+        );
+        assert_eq!(
+            classify_transaction_wire(&[0x82]),
+            Err(TransactionWireError::UnsupportedVersion(2))
+        );
+        assert_eq!(
+            classify_transaction_wire(&legacy_wire(0x82)),
+            Err(TransactionWireError::UnsupportedVersion(2))
+        );
     }
 
     #[test]
@@ -639,6 +746,15 @@ mod tests {
         assert!(matches!(
             decode_quic_frame_v2(&unchecked_frame(&oversized, &vec![0; 4_097])),
             Err(ProtocolError::TransactionTooLarge { max: 4_096, .. })
+        ));
+
+        let much_too_large = v2_header(TransactionVersion::V1, 1_048_576);
+        assert!(matches!(
+            decode_quic_frame_v2(&unchecked_frame(&much_too_large, &vec![0; 1_048_576])),
+            Err(ProtocolError::TransactionTooLarge {
+                actual: 1_048_576,
+                max: 4_096
+            })
         ));
     }
 

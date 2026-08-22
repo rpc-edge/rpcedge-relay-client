@@ -5,6 +5,7 @@ use crate::{
 };
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
+use rpcedge_relay_protocol::{classify_transaction_wire, ProtocolError};
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -344,6 +345,13 @@ impl AdaptiveRelayClient {
         &self,
         request: &AdaptiveRelayRequest<'_>,
     ) -> Result<RelaySubmitReceipt, RelayAttemptError> {
+        validate_transaction_wire_request(request).map_err(|error| {
+            RelayAttemptError::Protocol {
+                transport: RelayTransport::Quic,
+                message: error.to_string(),
+            }
+        })?;
+
         if !self.quic.ready() {
             return self
                 .submit_http(request, RelayFallbackReason::QuicDisconnected)
@@ -394,6 +402,26 @@ impl AdaptiveRelayClient {
     }
 }
 
+fn validate_transaction_wire_request(
+    request: &AdaptiveRelayRequest<'_>,
+) -> Result<(), ProtocolError> {
+    let classified = classify_transaction_wire(request.transaction)?;
+    if classified != request.transaction_version {
+        return Err(ProtocolError::TransactionVersionMismatch {
+            declared: request.transaction_version,
+            classified,
+        });
+    }
+    let max = classified.max_transaction_bytes();
+    if request.transaction.len() > max {
+        return Err(ProtocolError::TransactionTooLarge {
+            actual: request.transaction.len(),
+            max,
+        });
+    }
+    Ok(())
+}
+
 fn validate_protocol_v1_compatibility(
     request: &AdaptiveRelayRequest<'_>,
 ) -> Result<(), rpcedge_relay_protocol::ProtocolError> {
@@ -404,13 +432,6 @@ fn validate_protocol_v1_compatibility(
                 transaction_version: request.transaction_version,
             },
         );
-    }
-    let max = request.transaction_version.max_transaction_bytes();
-    if request.transaction.len() > max {
-        return Err(rpcedge_relay_protocol::ProtocolError::TransactionTooLarge {
-            actual: request.transaction.len(),
-            max,
-        });
     }
     Ok(())
 }
@@ -662,8 +683,13 @@ mod tests {
     }
 
     fn request() -> AdaptiveRelayRequest<'static> {
+        static LEGACY_TRANSACTION: [u8; 66] = {
+            let mut transaction = [0; 66];
+            transaction[0] = 1;
+            transaction
+        };
         AdaptiveRelayRequest {
-            transaction: &[1, 2, 3],
+            transaction: &LEGACY_TRANSACTION,
             transaction_version: TransactionVersion::Legacy,
             route_set: RouteSet::only([RelayRoute::TpuQuic]),
             request_id: "request-1".to_string(),
@@ -863,11 +889,60 @@ mod tests {
             AdaptiveRelayClientConfig::default(),
         );
         let mut v1 = request();
+        v1.transaction = &[0x81];
         v1.transaction_version = TransactionVersion::V1;
 
         assert!(matches!(
             client.submit(&v1).await,
             Err(RelayAttemptError::Protocol { .. })
+        ));
+        assert!(quic.requests.lock().unwrap().is_empty());
+        assert!(http.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mislabeled_transaction_is_rejected_before_ready_quic() {
+        let quic = Arc::new(FakeTransport::new(true, [Ok(response())]));
+        let http = Arc::new(FakeTransport::new(true, []));
+        let client = AdaptiveRelayClient::from_transports(
+            quic.clone(),
+            http.clone(),
+            AdaptiveRelayClientConfig::default(),
+        );
+        let mut mislabeled = request();
+        mislabeled.transaction = &[0x81];
+        mislabeled.transaction_version = TransactionVersion::Legacy;
+
+        assert!(matches!(
+            client.submit(&mislabeled).await,
+            Err(RelayAttemptError::Protocol {
+                transport: RelayTransport::Quic,
+                ..
+            })
+        ));
+        assert!(quic.requests.lock().unwrap().is_empty());
+        assert!(http.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mislabeled_small_v1_is_rejected_before_http_fallback() {
+        let quic = Arc::new(FakeTransport::new(false, []));
+        let http = Arc::new(FakeTransport::new(true, [Ok(response())]));
+        let client = AdaptiveRelayClient::from_transports(
+            quic.clone(),
+            http.clone(),
+            AdaptiveRelayClientConfig::default(),
+        );
+        let mut mislabeled = request();
+        mislabeled.transaction = &[0x81];
+        mislabeled.transaction_version = TransactionVersion::Legacy;
+
+        assert!(matches!(
+            client.submit(&mislabeled).await,
+            Err(RelayAttemptError::Protocol {
+                transport: RelayTransport::Quic,
+                ..
+            })
         ));
         assert!(quic.requests.lock().unwrap().is_empty());
         assert!(http.requests.lock().unwrap().is_empty());
