@@ -474,6 +474,15 @@ pub enum ProtocolError {
 mod tests {
     use super::*;
 
+    fn unchecked_frame<T: Serialize>(header: &T, payload: &[u8]) -> Vec<u8> {
+        let header = serde_json::to_vec(header).unwrap();
+        let mut frame = Vec::with_capacity(4 + header.len() + payload.len());
+        frame.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
     #[test]
     fn route_set_resolves_modes() {
         let defaults = [RelayRoute::TpuQuic, RelayRoute::TpuUdp];
@@ -608,6 +617,10 @@ mod tests {
             encode_quic_frame(&header, &vec![0; 1_233]),
             Err(ProtocolError::TransactionTooLarge { max: 1_232, .. })
         ));
+        assert!(matches!(
+            decode_quic_frame(&unchecked_frame(&header, &vec![0; 4_097])),
+            Err(ProtocolError::TransactionTooLarge { max: 1_232, .. })
+        ));
     }
 
     #[test]
@@ -621,6 +634,10 @@ mod tests {
         let oversized = v2_header(TransactionVersion::V1, 4_097);
         assert!(matches!(
             encode_quic_frame_v2(&oversized, &vec![0; 4_097]),
+            Err(ProtocolError::TransactionTooLarge { max: 4_096, .. })
+        ));
+        assert!(matches!(
+            decode_quic_frame_v2(&unchecked_frame(&oversized, &vec![0; 4_097])),
             Err(ProtocolError::TransactionTooLarge { max: 4_096, .. })
         ));
     }
