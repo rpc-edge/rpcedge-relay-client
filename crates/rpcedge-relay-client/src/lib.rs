@@ -7,9 +7,10 @@ pub use adaptive::{
 };
 use quinn::{ClientConfig, Endpoint};
 pub use rpcedge_relay_protocol::{
-    decode_transaction_base64, encode_quic_frame, encode_transaction_base64, QuicPayloadKind,
-    QuicSubmitHeader, RelayMethod, RelayRoute, ResponseMode, RouteSet, RouteSetMode, SubmitRequest,
-    TransactionEncoding, VERSION,
+    decode_transaction_base64, encode_quic_frame, encode_quic_frame_v2, encode_transaction_base64,
+    QuicPayloadKind, QuicSubmitHeader, QuicSubmitHeaderV2, RelayMethod, RelayRoute, ResponseMode,
+    RouteSet, RouteSetMode, SubmitRequest, TransactionEncoding, TransactionVersion, ALPN_V2,
+    DEFAULT_ALPN, VERSION, VERSION_V2,
 };
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -277,6 +278,13 @@ impl QuicRelayClientConfig {
 pub struct QuicRelayClient {
     config: QuicRelayClientConfig,
     connection: quinn::Connection,
+    negotiated_protocol: NegotiatedRelayProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NegotiatedRelayProtocol {
+    V1,
+    V2,
 }
 
 impl QuicRelayClient {
@@ -302,16 +310,39 @@ impl QuicRelayClient {
             .await
             .map_err(|_| RelayClientError::Timeout("QUIC connect"))?
             .map_err(RelayClientError::QuicConnect)?;
+        let negotiated_protocol = negotiated_relay_protocol(&connection)?;
 
-        Ok(Self { config, connection })
+        Ok(Self {
+            config,
+            connection,
+            negotiated_protocol,
+        })
+    }
+
+    #[must_use]
+    pub const fn negotiated_protocol(&self) -> NegotiatedRelayProtocol {
+        self.negotiated_protocol
     }
 
     pub async fn send_transaction_raw_bytes(
         &self,
         transaction: impl AsRef<[u8]>,
     ) -> Result<SubmitResponse, RelayClientError> {
-        self.send_transaction_raw_bytes_with_route_set(transaction, RouteSet::server_default())
+        self.send_transaction_raw_bytes_versioned(transaction, TransactionVersion::Legacy)
             .await
+    }
+
+    pub async fn send_transaction_raw_bytes_versioned(
+        &self,
+        transaction: impl AsRef<[u8]>,
+        transaction_version: TransactionVersion,
+    ) -> Result<SubmitResponse, RelayClientError> {
+        self.send_transaction_raw_bytes_with_route_set_versioned(
+            transaction,
+            transaction_version,
+            RouteSet::server_default(),
+        )
+        .await
     }
 
     pub async fn send_transaction_raw_bytes_with_route_set(
@@ -319,8 +350,28 @@ impl QuicRelayClient {
         transaction: impl AsRef<[u8]>,
         route_set: RouteSet,
     ) -> Result<SubmitResponse, RelayClientError> {
-        self.send_transaction_raw_bytes_with_request_id(transaction, route_set, None)
-            .await
+        self.send_transaction_raw_bytes_with_route_set_versioned(
+            transaction,
+            TransactionVersion::Legacy,
+            route_set,
+        )
+        .await
+    }
+
+    pub async fn send_transaction_raw_bytes_with_route_set_versioned(
+        &self,
+        transaction: impl AsRef<[u8]>,
+        transaction_version: TransactionVersion,
+        route_set: RouteSet,
+    ) -> Result<SubmitResponse, RelayClientError> {
+        self.send_transaction_raw_bytes_with_request_id_and_response_mode_versioned(
+            transaction,
+            transaction_version,
+            route_set,
+            None,
+            None,
+        )
+        .await
     }
 
     pub async fn send_transaction_raw_bytes_with_request_id(
@@ -345,19 +396,39 @@ impl QuicRelayClient {
         request_id: Option<String>,
         response_mode: Option<ResponseMode>,
     ) -> Result<SubmitResponse, RelayClientError> {
-        let (mut send, mut recv) =
-            tokio::time::timeout(self.config.timeout, self.connection.open_bi())
-                .await
-                .map_err(|_| RelayClientError::Timeout("QUIC open stream"))?
-                .map_err(RelayClientError::QuicOpenStream)?;
-        let frame = encode_routed_quic_frame(
+        self.send_transaction_raw_bytes_with_request_id_and_response_mode_versioned(
+            transaction,
+            TransactionVersion::Legacy,
+            route_set,
+            request_id,
+            response_mode,
+        )
+        .await
+    }
+
+    pub async fn send_transaction_raw_bytes_with_request_id_and_response_mode_versioned(
+        &self,
+        transaction: impl AsRef<[u8]>,
+        transaction_version: TransactionVersion,
+        route_set: RouteSet,
+        request_id: Option<String>,
+        response_mode: Option<ResponseMode>,
+    ) -> Result<SubmitResponse, RelayClientError> {
+        let frame = encode_routed_quic_frame_for_protocol(
+            self.negotiated_protocol,
             self.config.api_key.trim(),
             transaction.as_ref(),
+            transaction_version,
             route_set,
             request_id,
             response_mode,
         )
         .map_err(RelayClientError::Protocol)?;
+        let (mut send, mut recv) =
+            tokio::time::timeout(self.config.timeout, self.connection.open_bi())
+                .await
+                .map_err(|_| RelayClientError::Timeout("QUIC open stream"))?
+                .map_err(RelayClientError::QuicOpenStream)?;
         tokio::time::timeout(self.config.timeout, send.write_all(&frame))
             .await
             .map_err(|_| RelayClientError::Timeout("QUIC write"))?
@@ -411,12 +482,46 @@ fn build_quic_client_config(
             .with_no_client_auth()
     };
     crypto.enable_early_data = false;
+    crypto.alpn_protocols = quic_alpn_protocols().to_vec();
     Ok(ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .map_err(RelayClientError::QuicClientConfig)?,
     )))
 }
 
+fn quic_alpn_protocols() -> [Vec<u8>; 2] {
+    [
+        ALPN_V2.as_bytes().to_vec(),
+        DEFAULT_ALPN.as_bytes().to_vec(),
+    ]
+}
+
+fn negotiated_relay_protocol(
+    connection: &quinn::Connection,
+) -> Result<NegotiatedRelayProtocol, RelayClientError> {
+    let handshake = connection
+        .handshake_data()
+        .ok_or(RelayClientError::QuicHandshakeData)?;
+    let handshake = handshake
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .map_err(|_| RelayClientError::QuicHandshakeData)?;
+    relay_protocol_for_alpn(handshake.protocol.as_deref())
+}
+
+fn relay_protocol_for_alpn(
+    alpn: Option<&[u8]>,
+) -> Result<NegotiatedRelayProtocol, RelayClientError> {
+    match alpn {
+        Some(value) if value == ALPN_V2.as_bytes() => Ok(NegotiatedRelayProtocol::V2),
+        Some(value) if value == DEFAULT_ALPN.as_bytes() => Ok(NegotiatedRelayProtocol::V1),
+        Some(value) => Err(RelayClientError::UnsupportedAlpn(
+            String::from_utf8_lossy(value).into_owned(),
+        )),
+        None => Err(RelayClientError::UnsupportedAlpn("none".to_string())),
+    }
+}
+
+#[cfg(test)]
 fn encode_routed_quic_frame(
     api_key: &str,
     transaction: &[u8],
@@ -424,16 +529,68 @@ fn encode_routed_quic_frame(
     request_id: Option<String>,
     response_mode: Option<ResponseMode>,
 ) -> Result<Vec<u8>, rpcedge_relay_protocol::ProtocolError> {
-    let header = QuicSubmitHeader {
-        version: VERSION,
-        method: RelayMethod::SendTransaction,
-        payload_kind: QuicPayloadKind::SingleRawTransaction,
-        request_id,
+    encode_routed_quic_frame_for_protocol(
+        NegotiatedRelayProtocol::V1,
+        api_key,
+        transaction,
+        TransactionVersion::Legacy,
         route_set,
+        request_id,
         response_mode,
-        signature: None,
+    )
+}
+
+fn encode_routed_quic_frame_for_protocol(
+    protocol: NegotiatedRelayProtocol,
+    api_key: &str,
+    transaction: &[u8],
+    transaction_version: TransactionVersion,
+    route_set: RouteSet,
+    request_id: Option<String>,
+    response_mode: Option<ResponseMode>,
+) -> Result<Vec<u8>, rpcedge_relay_protocol::ProtocolError> {
+    let payload = match protocol {
+        NegotiatedRelayProtocol::V1 => {
+            if !transaction_version.supports_protocol_v1() {
+                return Err(
+                    rpcedge_relay_protocol::ProtocolError::UnsupportedTransactionVersion {
+                        protocol_version: VERSION,
+                        transaction_version,
+                    },
+                );
+            }
+            let header = QuicSubmitHeader {
+                version: VERSION,
+                method: RelayMethod::SendTransaction,
+                payload_kind: QuicPayloadKind::SingleRawTransaction,
+                request_id,
+                route_set,
+                response_mode,
+                signature: None,
+            };
+            encode_quic_frame(&header, transaction)?
+        }
+        NegotiatedRelayProtocol::V2 => {
+            let raw_transaction_length = u32::try_from(transaction.len()).map_err(|_| {
+                rpcedge_relay_protocol::ProtocolError::TransactionTooLarge {
+                    actual: transaction.len(),
+                    max: transaction_version.max_transaction_bytes(),
+                }
+            })?;
+            let header = QuicSubmitHeaderV2 {
+                version: VERSION_V2,
+                method: RelayMethod::SendTransaction,
+                payload_kind: QuicPayloadKind::SingleRawTransaction,
+                transaction_version,
+                raw_transaction_length,
+                request_id,
+                route_set,
+                response_mode,
+                signature: None,
+            };
+            encode_quic_frame_v2(&header, transaction)?
+        }
     };
-    let payload = encode_quic_frame(&header, transaction)?;
     let mut frame = Vec::with_capacity("api-key: \n".len() + api_key.len() + payload.len());
     frame.extend_from_slice(b"api-key: ");
     frame.extend_from_slice(api_key.as_bytes());
@@ -544,6 +701,10 @@ pub enum RelayClientError {
     QuicConnectStart(quinn::ConnectError),
     #[error("failed to connect QUIC: {0}")]
     QuicConnect(quinn::ConnectionError),
+    #[error("QUIC handshake data is unavailable or not rustls")]
+    QuicHandshakeData,
+    #[error("relay negotiated unsupported QUIC ALPN: {0}")]
+    UnsupportedAlpn(String),
     #[error("failed to build QUIC client config: {0}")]
     QuicClientConfig(quinn::crypto::rustls::NoInitialCipherSuite),
     #[error("failed to open QUIC stream: {0}")]
@@ -695,5 +856,85 @@ mod tests {
 
         let config = config.with_max_response_bytes(128 * 1024);
         assert_eq!(config.max_response_bytes, 128 * 1024);
+    }
+
+    #[test]
+    fn dual_stack_alpn_prefers_v2_before_v1() {
+        assert_eq!(
+            quic_alpn_protocols(),
+            [
+                rpcedge_relay_protocol::ALPN_V2.as_bytes().to_vec(),
+                rpcedge_relay_protocol::DEFAULT_ALPN.as_bytes().to_vec(),
+            ]
+        );
+        assert_eq!(
+            relay_protocol_for_alpn(Some(ALPN_V2.as_bytes())).unwrap(),
+            NegotiatedRelayProtocol::V2
+        );
+        assert_eq!(
+            relay_protocol_for_alpn(Some(DEFAULT_ALPN.as_bytes())).unwrap(),
+            NegotiatedRelayProtocol::V1
+        );
+        assert!(relay_protocol_for_alpn(Some(b"rpcedge-submit-v3")).is_err());
+        assert!(relay_protocol_for_alpn(None).is_err());
+    }
+
+    #[test]
+    fn v2_encoder_carries_explicit_transaction_version_and_length() {
+        let frame = encode_routed_quic_frame_for_protocol(
+            NegotiatedRelayProtocol::V2,
+            "key",
+            &vec![0; 4_096],
+            TransactionVersion::V1,
+            RouteSet::server_default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let newline = frame.iter().position(|byte| *byte == b'\n').unwrap();
+        let (header, payload) =
+            rpcedge_relay_protocol::decode_quic_frame_v2(&frame[newline + 1..]).unwrap();
+
+        assert_eq!(header.version, rpcedge_relay_protocol::VERSION_V2);
+        assert_eq!(header.transaction_version, TransactionVersion::V1);
+        assert_eq!(header.raw_transaction_length, 4_096);
+        assert_eq!(payload.len(), 4_096);
+    }
+
+    #[test]
+    fn negotiated_v1_allows_only_compatible_legacy_and_v0_payloads() {
+        for version in [TransactionVersion::Legacy, TransactionVersion::V0] {
+            assert!(encode_routed_quic_frame_for_protocol(
+                NegotiatedRelayProtocol::V1,
+                "key",
+                &vec![0; 1_232],
+                version,
+                RouteSet::server_default(),
+                None,
+                None,
+            )
+            .is_ok());
+            assert!(encode_routed_quic_frame_for_protocol(
+                NegotiatedRelayProtocol::V1,
+                "key",
+                &vec![0; 1_233],
+                version,
+                RouteSet::server_default(),
+                None,
+                None,
+            )
+            .is_err());
+        }
+
+        assert!(encode_routed_quic_frame_for_protocol(
+            NegotiatedRelayProtocol::V1,
+            "key",
+            &[0],
+            TransactionVersion::V1,
+            RouteSet::server_default(),
+            None,
+            None,
+        )
+        .is_err());
     }
 }

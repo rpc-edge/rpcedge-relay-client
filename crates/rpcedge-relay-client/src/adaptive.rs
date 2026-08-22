@@ -1,6 +1,7 @@
 use crate::{
     encode_transaction_base64, QuicRelayClient, QuicRelayClientConfig, RelayClient,
-    RelayClientError, ResponseMode, RouteSet, SubmitRequest, SubmitResponse,
+    RelayClientError, ResponseMode, RouteSet, SubmitRequest, SubmitResponse, TransactionVersion,
+    VERSION,
 };
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
@@ -86,6 +87,7 @@ pub enum RelayAttemptError {
 #[derive(Debug, Clone)]
 struct AdaptiveRelayRequest<'a> {
     transaction: &'a [u8],
+    transaction_version: TransactionVersion,
     route_set: RouteSet,
     request_id: String,
     response_mode: ResponseMode,
@@ -95,6 +97,7 @@ struct AdaptiveRelayRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RelayRequestSnapshot {
     transaction: Vec<u8>,
+    transaction_version: TransactionVersion,
     route_set: RouteSet,
     request_id: String,
     response_mode: ResponseMode,
@@ -105,6 +108,7 @@ impl From<&AdaptiveRelayRequest<'_>> for RelayRequestSnapshot {
     fn from(request: &AdaptiveRelayRequest<'_>) -> Self {
         Self {
             transaction: request.transaction.to_vec(),
+            transaction_version: request.transaction_version,
             route_set: request.route_set.clone(),
             request_id: request.request_id.clone(),
             response_mode: request.response_mode,
@@ -179,8 +183,9 @@ impl SubmitTransport for QuicSubmitTransport {
             .load_full()
             .ok_or_else(|| TransportAttemptError::PreWrite("QUIC is disconnected".to_string()))?;
         client
-            .send_transaction_raw_bytes_with_request_id_and_response_mode(
+            .send_transaction_raw_bytes_with_request_id_and_response_mode_versioned(
                 request.transaction,
+                request.transaction_version,
                 request.route_set.clone(),
                 Some(request.request_id.clone()),
                 Some(request.response_mode),
@@ -307,8 +312,27 @@ impl AdaptiveRelayClient {
         request_id: impl Into<String>,
         response_mode: ResponseMode,
     ) -> Result<RelaySubmitReceipt, RelayAttemptError> {
+        self.send_transaction_raw_bytes_versioned(
+            transaction,
+            TransactionVersion::Legacy,
+            route_set,
+            request_id,
+            response_mode,
+        )
+        .await
+    }
+
+    pub async fn send_transaction_raw_bytes_versioned(
+        &self,
+        transaction: impl AsRef<[u8]>,
+        transaction_version: TransactionVersion,
+        route_set: RouteSet,
+        request_id: impl Into<String>,
+        response_mode: ResponseMode,
+    ) -> Result<RelaySubmitReceipt, RelayAttemptError> {
         self.submit(&AdaptiveRelayRequest {
             transaction: transaction.as_ref(),
+            transaction_version,
             route_set,
             request_id: request_id.into(),
             response_mode,
@@ -352,6 +376,12 @@ impl AdaptiveRelayClient {
         request: &AdaptiveRelayRequest<'_>,
         fallback_reason: RelayFallbackReason,
     ) -> Result<RelaySubmitReceipt, RelayAttemptError> {
+        validate_protocol_v1_compatibility(request).map_err(|error| {
+            RelayAttemptError::Protocol {
+                transport: RelayTransport::Http,
+                message: error.to_string(),
+            }
+        })?;
         self.http
             .submit(request)
             .await
@@ -362,6 +392,27 @@ impl AdaptiveRelayClient {
             })
             .map_err(|error| map_attempt_error(RelayTransport::Http, error))
     }
+}
+
+fn validate_protocol_v1_compatibility(
+    request: &AdaptiveRelayRequest<'_>,
+) -> Result<(), rpcedge_relay_protocol::ProtocolError> {
+    if !request.transaction_version.supports_protocol_v1() {
+        return Err(
+            rpcedge_relay_protocol::ProtocolError::UnsupportedTransactionVersion {
+                protocol_version: VERSION,
+                transaction_version: request.transaction_version,
+            },
+        );
+    }
+    let max = request.transaction_version.max_transaction_bytes();
+    if request.transaction.len() > max {
+        return Err(rpcedge_relay_protocol::ProtocolError::TransactionTooLarge {
+            actual: request.transaction.len(),
+            max,
+        });
+    }
+    Ok(())
 }
 
 async fn run_quic_supervisor(
@@ -613,6 +664,7 @@ mod tests {
     fn request() -> AdaptiveRelayRequest<'static> {
         AdaptiveRelayRequest {
             transaction: &[1, 2, 3],
+            transaction_version: TransactionVersion::Legacy,
             route_set: RouteSet::only([RelayRoute::TpuQuic]),
             request_id: "request-1".to_string(),
             response_mode: ResponseMode::Fast,
@@ -799,5 +851,25 @@ mod tests {
             quic.requests.lock().unwrap().as_slice(),
             http.requests.lock().unwrap().as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn v1_transaction_never_downgrades_to_http() {
+        let quic = Arc::new(FakeTransport::new(false, []));
+        let http = Arc::new(FakeTransport::new(true, [Ok(response())]));
+        let client = AdaptiveRelayClient::from_transports(
+            quic.clone(),
+            http.clone(),
+            AdaptiveRelayClientConfig::default(),
+        );
+        let mut v1 = request();
+        v1.transaction_version = TransactionVersion::V1;
+
+        assert!(matches!(
+            client.submit(&v1).await,
+            Err(RelayAttemptError::Protocol { .. })
+        ));
+        assert!(quic.requests.lock().unwrap().is_empty());
+        assert!(http.requests.lock().unwrap().is_empty());
     }
 }

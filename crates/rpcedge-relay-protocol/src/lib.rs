@@ -457,6 +457,13 @@ pub enum ProtocolError {
     TransactionTooLarge { actual: usize, max: usize },
     #[error("transaction length does not match header: declared {declared}, actual {actual}")]
     TransactionLengthMismatch { declared: usize, actual: usize },
+    #[error(
+        "transaction version {transaction_version:?} is unsupported by relay protocol v{protocol_version}"
+    )]
+    UnsupportedTransactionVersion {
+        protocol_version: u8,
+        transaction_version: TransactionVersion,
+    },
     #[error("invalid json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid base64 transaction: {0}")]
