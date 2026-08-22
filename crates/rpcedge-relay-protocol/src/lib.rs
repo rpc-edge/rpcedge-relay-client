@@ -3,8 +3,11 @@ use serde::{Deserialize, Serialize};
 
 pub const VERSION: u8 = 1;
 pub const DEFAULT_ALPN: &str = "rpcedge-submit-v1";
+pub const VERSION_V2: u8 = 2;
+pub const ALPN_V2: &str = "rpcedge-submit-v2";
 pub const DEFAULT_MAX_FRAME_HEADER_BYTES: usize = 4096;
 pub const DEFAULT_MAX_TRANSACTION_BYTES: usize = 1232;
+pub const MAX_V1_TRANSACTION_BYTES: usize = 4096;
 pub const DEFAULT_MAX_BUNDLE_TRANSACTIONS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,6 +232,53 @@ pub struct QuicSubmitHeader {
     pub signature: Option<String>,
 }
 
+/// Version-two QUIC submission metadata.
+///
+/// V2 is intentionally a separate type so the established V1 wire codec stays
+/// byte-for-byte stable and remains available for rollback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuicSubmitHeaderV2 {
+    pub version: u8,
+    pub method: RelayMethod,
+    pub payload_kind: QuicPayloadKind,
+    pub transaction_version: TransactionVersion,
+    pub raw_transaction_length: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub route_set: RouteSet,
+    #[serde(
+        default,
+        rename = "responseMode",
+        alias = "response_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub response_mode: Option<ResponseMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransactionVersion {
+    Legacy,
+    V0,
+    V1,
+}
+
+impl TransactionVersion {
+    pub const fn max_transaction_bytes(self) -> usize {
+        match self {
+            Self::Legacy | Self::V0 => DEFAULT_MAX_TRANSACTION_BYTES,
+            Self::V1 => MAX_V1_TRANSACTION_BYTES,
+        }
+    }
+
+    pub const fn supports_protocol_v1(self) -> bool {
+        matches!(self, Self::Legacy | Self::V0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QuicPayloadKind {
@@ -294,6 +344,71 @@ pub fn decode_quic_frame(frame: &[u8]) -> Result<(QuicSubmitHeader, Vec<u8>), Pr
     Ok((header, payload))
 }
 
+pub fn encode_quic_frame_v2(
+    header: &QuicSubmitHeaderV2,
+    payload: &[u8],
+) -> Result<Vec<u8>, ProtocolError> {
+    validate_version_v2(header.version)?;
+    validate_v2_transaction(header, payload)?;
+    let header_bytes = serde_json::to_vec(header).map_err(ProtocolError::Json)?;
+    if header_bytes.len() > DEFAULT_MAX_FRAME_HEADER_BYTES {
+        return Err(ProtocolError::HeaderTooLarge {
+            actual: header_bytes.len(),
+            max: DEFAULT_MAX_FRAME_HEADER_BYTES,
+        });
+    }
+
+    let mut out = Vec::with_capacity(4 + header_bytes.len() + payload.len());
+    out.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&header_bytes);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+pub fn decode_quic_frame_v2(frame: &[u8]) -> Result<(QuicSubmitHeaderV2, Vec<u8>), ProtocolError> {
+    if frame.len() < 4 {
+        return Err(ProtocolError::FrameTooShort);
+    }
+    let header_len = u32::from_be_bytes(frame[0..4].try_into().expect("fixed length")) as usize;
+    if header_len > DEFAULT_MAX_FRAME_HEADER_BYTES {
+        return Err(ProtocolError::HeaderTooLarge {
+            actual: header_len,
+            max: DEFAULT_MAX_FRAME_HEADER_BYTES,
+        });
+    }
+    if frame.len() < 4 + header_len {
+        return Err(ProtocolError::FrameTooShort);
+    }
+
+    let header: QuicSubmitHeaderV2 =
+        serde_json::from_slice(&frame[4..4 + header_len]).map_err(ProtocolError::Json)?;
+    validate_version_v2(header.version)?;
+    let payload = frame[4 + header_len..].to_vec();
+    validate_v2_transaction(&header, &payload)?;
+    Ok((header, payload))
+}
+
+fn validate_v2_transaction(
+    header: &QuicSubmitHeaderV2,
+    payload: &[u8],
+) -> Result<(), ProtocolError> {
+    if header.payload_kind != QuicPayloadKind::SingleRawTransaction {
+        return Err(ProtocolError::InvalidPayload(
+            "protocol v2 supports single raw transactions only",
+        ));
+    }
+    let actual = payload.len();
+    let declared = header.raw_transaction_length as usize;
+    if declared != actual {
+        return Err(ProtocolError::TransactionLengthMismatch { declared, actual });
+    }
+    let max = header.transaction_version.max_transaction_bytes();
+    if actual > max {
+        return Err(ProtocolError::TransactionTooLarge { actual, max });
+    }
+    Ok(())
+}
+
 pub fn encode_transaction_base64(transaction: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(transaction)
 }
@@ -320,6 +435,14 @@ fn validate_version(version: u8) -> Result<(), ProtocolError> {
     }
 }
 
+fn validate_version_v2(version: u8) -> Result<(), ProtocolError> {
+    if version == VERSION_V2 {
+        Ok(())
+    } else {
+        Err(ProtocolError::UnsupportedVersion(version))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
     #[error("unsupported protocol version: {0}")]
@@ -332,6 +455,8 @@ pub enum ProtocolError {
     HeaderTooLarge { actual: usize, max: usize },
     #[error("transaction is too large: {actual} > {max}")]
     TransactionTooLarge { actual: usize, max: usize },
+    #[error("transaction length does not match header: declared {declared}, actual {actual}")]
+    TransactionLengthMismatch { declared: usize, actual: usize },
     #[error("invalid json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid base64 transaction: {0}")]
@@ -439,5 +564,104 @@ mod tests {
             Some(ResponseMode::RouteResults)
         );
         assert_eq!(decoded_payload, payload);
+    }
+
+    fn v2_header(
+        transaction_version: TransactionVersion,
+        raw_transaction_length: u32,
+    ) -> QuicSubmitHeaderV2 {
+        QuicSubmitHeaderV2 {
+            version: VERSION_V2,
+            method: RelayMethod::SendTransaction,
+            payload_kind: QuicPayloadKind::SingleRawTransaction,
+            transaction_version,
+            raw_transaction_length,
+            request_id: Some("req-v2".to_string()),
+            route_set: RouteSet::server_default(),
+            response_mode: Some(ResponseMode::Fast),
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn v1_codec_retains_1232_byte_ceiling() {
+        let header = QuicSubmitHeader {
+            version: VERSION,
+            method: RelayMethod::SendTransaction,
+            payload_kind: QuicPayloadKind::SingleRawTransaction,
+            request_id: None,
+            route_set: RouteSet::server_default(),
+            response_mode: None,
+            signature: None,
+        };
+
+        let frame = encode_quic_frame(&header, &vec![0; 1_232]).unwrap();
+        assert_eq!(decode_quic_frame(&frame).unwrap().1.len(), 1_232);
+        assert!(matches!(
+            encode_quic_frame(&header, &vec![0; 1_233]),
+            Err(ProtocolError::TransactionTooLarge { max: 1_232, .. })
+        ));
+    }
+
+    #[test]
+    fn v2_accepts_v1_through_4096_and_rejects_4097() {
+        let header = v2_header(TransactionVersion::V1, 4_096);
+        let frame = encode_quic_frame_v2(&header, &vec![0; 4_096]).unwrap();
+        let (decoded, payload) = decode_quic_frame_v2(&frame).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(payload.len(), 4_096);
+
+        let oversized = v2_header(TransactionVersion::V1, 4_097);
+        assert!(matches!(
+            encode_quic_frame_v2(&oversized, &vec![0; 4_097]),
+            Err(ProtocolError::TransactionTooLarge { max: 4_096, .. })
+        ));
+    }
+
+    #[test]
+    fn v2_retains_1232_ceiling_for_legacy_and_v0() {
+        for version in [TransactionVersion::Legacy, TransactionVersion::V0] {
+            let header = v2_header(version, 1_233);
+            assert!(matches!(
+                encode_quic_frame_v2(&header, &vec![0; 1_233]),
+                Err(ProtocolError::TransactionTooLarge { max: 1_232, .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn v2_rejects_declared_length_mismatch() {
+        let header = v2_header(TransactionVersion::V1, 4);
+        assert!(matches!(
+            encode_quic_frame_v2(&header, &[1, 2, 3]),
+            Err(ProtocolError::TransactionLengthMismatch {
+                declared: 4,
+                actual: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn v2_rejects_future_version_and_truncated_frames() {
+        let mut future = serde_json::to_value(v2_header(TransactionVersion::V1, 1)).unwrap();
+        future["version"] = serde_json::json!(VERSION_V2 + 1);
+        let header = serde_json::to_vec(&future).unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(header.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&header);
+        frame.push(0);
+
+        assert!(matches!(
+            decode_quic_frame_v2(&frame),
+            Err(ProtocolError::UnsupportedVersion(version)) if version == VERSION_V2 + 1
+        ));
+        assert!(matches!(
+            decode_quic_frame_v2(&[0, 0, 0]),
+            Err(ProtocolError::FrameTooShort)
+        ));
+        assert!(matches!(
+            decode_quic_frame_v2(&[0, 0, 0, 8, b'{']),
+            Err(ProtocolError::FrameTooShort)
+        ));
     }
 }
